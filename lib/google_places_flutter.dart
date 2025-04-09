@@ -11,6 +11,8 @@ import 'package:rxdart/rxdart.dart';
 
 import 'DioErrorHandler.dart';
 
+typedef LatLngInputDetected = void Function(String latLngString);
+
 class GooglePlaceAutoCompleteTextField extends StatefulWidget {
   InputDecoration inputDecoration;
   ItemClick? itemClick;
@@ -24,7 +26,6 @@ class GooglePlaceAutoCompleteTextField extends StatefulWidget {
   TextEditingController textEditingController = TextEditingController();
   ListItemBuilder? itemBuilder;
   Widget? seperatedBuilder;
-  void clearData;
   BoxDecoration? boxDecoration;
   bool isCrossBtnShown;
   bool showError;
@@ -43,6 +44,10 @@ class GooglePlaceAutoCompleteTextField extends StatefulWidget {
 
   /// This is expressed in **meters**
   final int? radius;
+
+  /// Callback function to be invoked when the input text resembles a LatLng coordinate pair.
+  /// The API call will be skipped when this callback is triggered.
+  final LatLngInputDetected? onLatLngInputDetected;
 
   GooglePlaceAutoCompleteTextField(
       {required this.textEditingController,
@@ -70,7 +75,7 @@ class GooglePlaceAutoCompleteTextField extends StatefulWidget {
       this.radius,
       this.formSubmitCallback,
       this.textInputAction,
-      this.clearData});
+      this.onLatLngInputDetected});
 
   @override
   _GooglePlaceAutoCompleteTextFieldState createState() =>
@@ -91,6 +96,10 @@ class _GooglePlaceAutoCompleteTextFieldState
   late var _dio;
 
   CancelToken? _cancelToken = CancelToken();
+
+  /// Regex to detect "lat, lng" pattern with space and decimals
+  /// ("12.34,56.78", "12.34, 56.78", "-12, 56", etc)
+  final _latLngRegex = RegExp(r'^-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?$');
 
   @override
   Widget build(BuildContext context) {
@@ -118,10 +127,12 @@ class _GooglePlaceAutoCompleteTextFieldState
                 focusNode: widget.focusNode ?? FocusNode(),
                 textInputAction: widget.textInputAction ?? TextInputAction.done,
                 onFieldSubmitted: (value) {
-                  if(widget.formSubmitCallback!=null){
+                  if (widget.formSubmitCallback != null) {
                     widget.formSubmitCallback!();
                   }
 
+                  // Remove overlay on submit
+                  _removeOverlay();
                 },
                 validator: (inputString) {
                   return widget.validator?.call(inputString, context);
@@ -135,11 +146,9 @@ class _GooglePlaceAutoCompleteTextFieldState
                 },
               ),
             ),
-            (!widget.isCrossBtnShown)
+            (!widget.isCrossBtnShown || !isCrossBtn)
                 ? SizedBox()
-                : isCrossBtn && _showCrossIconWidget()
-                    ? IconButton(onPressed: clearData, icon: Icon(Icons.close))
-                    : SizedBox()
+                : IconButton(onPressed: clearData, icon: Icon(Icons.close))
           ],
         ),
       ),
@@ -184,7 +193,10 @@ class _GooglePlaceAutoCompleteTextFieldState
       String proxyURL = "https://cors-anywhere.herokuapp.com/";
       String url = kIsWeb ? proxyURL + apiURL : apiURL;
 
-      Response response = await _dio.get(url);
+      // Ensure previous overlay is removed before showing new results
+      _removeOverlay();
+
+      Response response = await _dio.get(url, cancelToken: _cancelToken);
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
 
       Map map = response.data;
@@ -195,25 +207,44 @@ class _GooglePlaceAutoCompleteTextFieldState
       PlacesAutocompleteResponse subscriptionResponse =
           PlacesAutocompleteResponse.fromJson(response.data);
 
-      if (text.length == 0) {
-        alPredictions.clear();
-        this._overlayEntry!.remove();
-        return;
-      }
+      // Redundant check? text.length == 0 is handled in textChanged
+      // if (text.length == 0) {
+      //   alPredictions.clear();
+      //   _removeOverlay(); // Ensure overlay is removed
+      //   return;
+      // }
 
-      isSearched = false;
+      isSearched = false; // What is this used for? Seems unused
       alPredictions.clear();
       if (subscriptionResponse.predictions!.length > 0 &&
           (widget.textEditingController.text.toString().trim()).isNotEmpty) {
         alPredictions.addAll(subscriptionResponse.predictions!);
       }
 
-      this._overlayEntry = null;
-      this._overlayEntry = this._createOverlayEntry();
-      Overlay.of(context).insert(this._overlayEntry!);
+      // Only show overlay if there are predictions
+      if (alPredictions.isNotEmpty) {
+        this._overlayEntry = this._createOverlayEntry();
+        if (this._overlayEntry != null) {
+          Overlay.of(context).insert(this._overlayEntry!);
+        }
+      } else {
+        // If no predictions, ensure overlay is removed
+        _removeOverlay();
+      }
     } catch (e) {
-      var errorHandler = ErrorHandler.internal().handleError(e);
-      _showSnackBar("${errorHandler.message}");
+      if (e is DioException && e.type == DioExceptionType.cancel) {
+        // Request was cancelled (e.g., user typed quickly), ignore error.
+        print("Request cancelled");
+      } else {
+        // Handle other errors
+        var errorHandler = ErrorHandler.internal().handleError(e);
+        _showSnackBar("${errorHandler.message}");
+        // Clear predictions and overlay on error
+        setState(() {
+          alPredictions.clear();
+        });
+        _removeOverlay();
+      }
     }
   }
 
@@ -225,71 +256,158 @@ class _GooglePlaceAutoCompleteTextFieldState
         .distinct()
         .debounceTime(Duration(milliseconds: widget.debounceTime))
         .listen(textChanged);
+
+    // Ensure cross button visibility is correct initially
+    isCrossBtn = widget.textEditingController.text.isNotEmpty;
+  }
+
+  @override
+  void dispose() {
+    subject.close(); // Close the stream controller
+    _cancelToken?.cancel(); // Cancel any ongoing requests
+    _dio.close(force: true); // Close the dio instance
+    _removeOverlay(); // Ensure overlay is removed on dispose
+    // Don't dispose the controller passed from the parent widget
+    // widget.textEditingController.dispose();
+    // Don't dispose the focus node passed from the parent widget
+    // widget.focusNode?.dispose();
+    super.dispose();
   }
 
   textChanged(String text) async {
-    if (text.isNotEmpty) {
-      getLocation(text);
-    } else {
-      alPredictions.clear();
-      this._overlayEntry!.remove();
+    String trimmedText = text.trim();
+
+    // If text is empty, clear predictions and remove overlay
+    if (trimmedText.isEmpty) {
+      setState(() {
+        alPredictions.clear();
+        // Update cross button state if needed (already handled by onChanged)
+      });
+      _removeOverlay();
+      return; // Stop processing
     }
+
+    // Check if the input matches the LatLng pattern
+    if (_latLngRegex.hasMatch(trimmedText)) {
+      // If it matches, call the callback and do *not* proceed to API call
+      widget.onLatLngInputDetected?.call(trimmedText);
+      // Clear any existing predictions and remove the overlay
+      setState(() {
+        alPredictions.clear();
+      });
+      _removeOverlay();
+      return; // Stop processing, skip API call
+    }
+
+    // If text is not empty and not a LatLng pattern, proceed with API call
+    getLocation(trimmedText);
   }
 
   OverlayEntry? _createOverlayEntry() {
-    if (context.findRenderObject() != null) {
-      RenderBox renderBox = context.findRenderObject() as RenderBox;
-      var size = renderBox.size;
-      var offset = renderBox.localToGlobal(Offset.zero);
-      return OverlayEntry(
-          builder: (context) => Positioned(
-                left: offset.dx,
-                top: size.height + offset.dy,
-                width: size.width,
-                child: CompositedTransformFollower(
-                  showWhenUnlinked: false,
-                  link: this._layerLink,
-                  offset: Offset(0.0, size.height + 5.0),
-                  child: Material(
-                      child: ListView.separated(
-                    padding: EdgeInsets.zero,
-                    shrinkWrap: true,
-                    itemCount: alPredictions.length,
-                    separatorBuilder: (context, pos) =>
-                        widget.seperatedBuilder ?? SizedBox(),
-                    itemBuilder: (BuildContext context, int index) {
-                      return InkWell(
-                        onTap: () async {
-                          var selectedData = alPredictions[index];
-                          if (index < alPredictions.length) {
-                            widget.itemClick!(selectedData);
+    // Ensure the context is still valid and mounted before creating overlay
+    if (!mounted || context.findRenderObject() == null) return null;
 
-                            if (widget.isLatLngRequired) {
-                             await getPlaceDetailsFromPlaceId(selectedData);
+    RenderBox renderBox = context.findRenderObject() as RenderBox;
+    var size = renderBox.size;
+    var offset = renderBox.localToGlobal(Offset.zero);
+
+    // Ensure overlay doesn't go off-screen vertically
+    final screenHeight = MediaQuery.of(context).size.height;
+    final maxOverlayHeight =
+        screenHeight - (offset.dy + size.height + 10); // Add some padding
+
+    return OverlayEntry(
+        builder: (context) => Positioned(
+            left: offset.dx,
+            top: size.height + offset.dy,
+            width: size.width,
+            child: CompositedTransformFollower(
+              showWhenUnlinked: false,
+              link: this._layerLink,
+              offset: Offset(0.0, size.height + 5.0),
+              child: Material(
+                elevation: 4.0, // Add elevation for visual separation
+                child: ConstrainedBox(
+                    // Limit overlay height
+                    constraints: BoxConstraints(
+                        maxHeight: maxOverlayHeight > 100
+                            ? maxOverlayHeight
+                            : 100 // Min height
+                        ),
+                    child: ListView.separated(
+                      padding: EdgeInsets.zero,
+                      shrinkWrap: true,
+                      itemCount: alPredictions.length,
+                      separatorBuilder: (context, pos) =>
+                          widget.seperatedBuilder ?? const Divider(height: 1),
+                      itemBuilder: (BuildContext context, int index) {
+                        return InkWell(
+                          onTap: () async {
+                            var selectedData = alPredictions[index];
+                            // Check index validity just in case
+                            if (index < alPredictions.length) {
+                              // Hide keyboard
+                              FocusScope.of(context).unfocus();
+
+                              // Update text field before potentially slow details fetch
+                              widget.textEditingController.text =
+                                  selectedData.description ?? '';
+
+                              // Move cursor to end
+                              widget.textEditingController.selection =
+                                  TextSelection.fromPosition(
+                                TextPosition(
+                                    offset: widget
+                                        .textEditingController.text.length),
+                              );
+
+                              // Call itemClick callback immediately
+                              widget.itemClick?.call(selectedData);
+
+                              // Clear predictions and remove overlay *before* async call
+                              setState(() {
+                                alPredictions.clear();
+                              });
+                              _removeOverlay();
+
+                              // Fetch details if required (can take time)
+                              if (widget.isLatLngRequired) {
+                                await getPlaceDetailsFromPlaceId(selectedData);
+                              }
                             }
-                            removeOverlay();
-                          }
-                        },
-                        child: widget.itemBuilder != null
-                            ? widget.itemBuilder!(
-                                context, index, alPredictions[index])
-                            : Container(
-                                padding: EdgeInsets.all(10),
-                                child: Text(alPredictions[index].description!)),
-                      );
-                    },
-                  )),
-                ),
-              ));
-    }
+                          },
+                          child: widget.itemBuilder != null
+                              ? widget.itemBuilder!(
+                                  context, index, alPredictions[index])
+                              : Container(
+                                  padding: EdgeInsets.all(10),
+                                  child:
+                                      Text(alPredictions[index].description!)),
+                        );
+                      },
+                    )),
+              ),
+            )));
   }
 
-  removeOverlay() {
-    alPredictions.clear();
-    this._overlayEntry = this._createOverlayEntry();
+  // Renamed from removeOverlay to avoid confusion with OverlayEntry.remove()
+  /// Clears predictions and removes the overlay entry.
+  void _removeOverlay() {
+    // Check if overlay exists and is part of the overlay tree
+    if (this._overlayEntry != null) {
+      try {
+        this._overlayEntry?.remove();
+      } catch (e) {
+        print("Error removing overlay: $e");
+      }
+      _overlayEntry = null; // Ensure reference is cleared
+    }
 
-    Overlay.of(context).insert(this._overlayEntry!);
-    this._overlayEntry!.markNeedsBuild();
+    // Also clear the predictions list associated with the overlay
+    // This might be redundant if called from places that already clear it, but safe.
+    // setState(() {
+    //   alPredictions.clear();
+    // });
   }
 
   Future<void> getPlaceDetailsFromPlaceId(Prediction prediction) async {
@@ -304,10 +422,16 @@ class _GooglePlaceAutoCompleteTextFieldState
 
       PlaceDetails placeDetails = PlaceDetails.fromJson(response.data);
 
-      prediction.lat = placeDetails.result!.geometry!.location!.lat.toString();
-      prediction.lng = placeDetails.result!.geometry!.location!.lng.toString();
+      prediction.lat = placeDetails.result?.geometry?.location?.lat.toString();
+      prediction.lng = placeDetails.result?.geometry?.location?.lng.toString();
 
-      widget.getPlaceDetailWithLatLng!(prediction);
+      // Check if lat/lng were successfully retrieved
+      if (prediction.lat != null && prediction.lng != null) {
+        // print(222222); // Keep for debugging if needed
+        widget.getPlaceDetailWithLatLng?.call(prediction);
+      } else {
+        _showSnackBar("Could not retrieve coordinates for the selected place.");
+      }
     } catch (e) {
       var errorHandler = ErrorHandler.internal().handleError(e);
       _showSnackBar("${errorHandler.message}");
@@ -325,21 +449,14 @@ class _GooglePlaceAutoCompleteTextFieldState
       isCrossBtn = false;
     });
 
-    if (this._overlayEntry != null) {
-      try {
-        this._overlayEntry?.remove();
-      } catch (e) {}
-    }
-  }
-
-  _showCrossIconWidget() {
-    return (widget.textEditingController.text.isNotEmpty);
+    _removeOverlay(); // Use the helper method to remove overlay
   }
 
   _showSnackBar(String errorData) {
-    if (widget.showError) {
+    if (widget.showError && mounted) {
+      // Check if widget is still mounted
       final snackBar = SnackBar(
-        content: Text("$errorData"),
+        content: Text(errorData), // Removed unnecessary interpolation
       );
 
       // Find the ScaffoldMessenger in the widget tree
