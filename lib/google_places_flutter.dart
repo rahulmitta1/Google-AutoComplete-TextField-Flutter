@@ -442,6 +442,7 @@ class _GooglePlaceAutoCompleteTextFieldState
     widget.textEditingController.clear();
     if (_cancelToken?.isCancelled == false) {
       _cancelToken?.cancel();
+      _cancelToken = CancelToken();
     }
 
     setState(() {
